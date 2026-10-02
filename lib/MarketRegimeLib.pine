@@ -1,0 +1,470 @@
+//@version=6
+// @description Market Regime Classifier v2.0 — shared library for indicators and strategies.
+//
+// TRADINGVIEW PUBLISH STEPS:
+// 1. Pine Editor → New → paste this file → Save as "MarketRegimeLib"
+// 2. Publish script (visibility: public or invite-only)
+// 3. Update import in MarketRegimeClassifier.pine: import YOUR_USERNAME/MarketRegimeLib/1 as regime
+//
+// VALIDATION CHECKLIST (after publishing):
+// - Dashboard matches v2 regime labels and confluence scores
+// - longReady is false on regimeTransition bars
+// - newBullTrend fires only on first bar after debounced bullish regime change
+// - hardExitLong fires when regime flips away from bullish trend
+// - positionScale scales down in high-vol regimes, up in low-vol regimes
+library("MarketRegimeLib", overlay=true)
+
+//+------------------------------------------------------------------+
+//| Exported Types                                                   |
+//+------------------------------------------------------------------+
+export type RegimeState
+    string finalRegime
+    bool   isTrending
+    bool   isMeanReverting
+    bool   isChop
+    bool   isBullishTrend
+    bool   isBearishTrend
+    bool   regimeTransition
+    int    confirmedBars
+    float  dirConfluence
+    float  dirConfidence
+    float  trendStrength
+    float  overallConfidence
+    float  volPercentile
+    bool   volLow
+    bool   volHigh
+    string momStrength
+    string momState
+    string dirState
+    string volState
+    bool   aligned
+    bool   bullAligned
+    bool   bearAligned
+    bool   momBullish
+    bool   momBearish
+    float  diPlus
+    float  diMinus
+    float  adxVal
+    float  momROC
+    float  smoothHurst
+    float  hurstScore
+    float  adxScore
+    float  r2Val
+    float  r2Score
+    float  momConfidence
+    bool   dirTrending
+    bool   dirMeanRevert
+
+export type TrendParams
+    int   minRegimeBars
+    float minTrendStrength
+    float minConfidence
+    float minAdx
+    int   maxFreshBars
+    float exitTrendStrength
+    float exitConfidence
+    float exitDirConfluence
+
+export type TrendVars
+    bool  trendStable
+    bool  trendLongAllowed
+    bool  trendShortAllowed
+    bool  trendActive
+    bool  qualityPass
+    bool  strongMomentum
+    bool  moderateOrStrong
+    bool  diBiasLong
+    bool  diBiasShort
+    bool  adxStrong
+    bool  longReady
+    bool  shortReady
+    bool  newBullTrend
+    bool  newBearTrend
+    bool  trendFresh
+    bool  pullbackInBullTrend
+    bool  pullbackInBearTrend
+    bool  pullbackRecoveryLong
+    bool  pullbackRecoveryShort
+    bool  momentumAccelLong
+    bool  momentumAccelShort
+    bool  regimeExitLong
+    bool  regimeExitShort
+    bool  trendDecay
+    bool  confidenceDecay
+    bool  momentumFade
+    bool  dirWeakening
+    bool  softExitLong
+    bool  hardExitLong
+    bool  softExitShort
+    bool  hardExitShort
+    float volRiskScale
+    float stopAtrMult
+    float targetAtrMult
+    float positionScale
+
+//+------------------------------------------------------------------+
+//| Helper Functions                                                 |
+//+------------------------------------------------------------------+
+calcHurst(float src, int lookback) =>
+    float h = 0.5
+    if bar_index >= lookback
+        float rangeVal = ta.highest(src, lookback) - ta.lowest(src, lookback)
+        float stdDev   = ta.stdev(src, lookback)
+        float rs       = stdDev > 0 ? rangeVal / stdDev : 1.0
+        float h_val = math.log(rs) / math.log(lookback / 2.0)
+        if rs <= 0
+            h := 0.5
+        else if h_val > 1.0
+            h := 1.0
+        else if h_val < 0.0
+            h := 0.0
+        else
+            h := h_val
+    h
+
+calcR2(float src, int lookback) =>
+    float r2 = 0.0
+    if bar_index >= lookback
+        float corr = ta.correlation(src, bar_index, lookback)
+        r2 := corr * corr
+    r2
+
+calcATR_ROC(float src, int lookback, int atrLen) =>
+    float roc     = (src - src[lookback]) / src[lookback] * 100.0
+    float atr     = ta.atr(atrLen)
+    float atrNorm = 1.0
+    if atr > 0
+        atrNorm := atr / src * 100.0
+    float result = 0.0
+    if atrNorm > 0
+        result := roc / atrNorm
+    result
+
+//+------------------------------------------------------------------+
+//| Core Regime Calculation                                          |
+//+------------------------------------------------------------------+
+export calcRegime(
+     int   inpHurstLookback,
+     int   inpHurstSmooth,
+     float inpHurstWt,
+     float inpHurstTrendThresh,
+     float inpHurstMRThresh,
+     int   inpAdxLen,
+     int   inpAdxSmooth,
+     float inpAdxWt,
+     float inpAdxTrendThresh,
+     float inpAdxMRThresh,
+     int   inpR2Lookback,
+     float inpR2Wt,
+     float inpR2TrendThresh,
+     float inpR2MRThresh,
+     float inpConfluenceTrend,
+     float inpConfluenceMR,
+     int   inpVolLookback,
+     float inpVolLowPct,
+     float inpVolHighPct,
+     int   inpMomLookback,
+     int   inpMomFast,
+     int   inpMomSlow,
+     float inpMomStrongATR,
+     float inpMomModATR,
+     int   inpDebounceBars) =>
+    // Directional confluence
+    rawHurst    = calcHurst(close, inpHurstLookback)
+    smoothHurst = ta.ema(rawHurst, inpHurstSmooth)
+    float hurstScore = 0.0
+    if smoothHurst >= inpHurstTrendThresh
+        hurstScore := 100.0
+    else if smoothHurst > inpHurstMRThresh
+        hurstScore := (smoothHurst - inpHurstMRThresh) / (inpHurstTrendThresh - inpHurstMRThresh) * 100.0
+
+    [diPlus, diMinus, adxVal] = ta.dmi(inpAdxLen, inpAdxSmooth)
+    float adxScore = 0.0
+    if adxVal >= inpAdxTrendThresh
+        adxScore := 100.0
+    else if adxVal > inpAdxMRThresh
+        adxScore := (adxVal - inpAdxMRThresh) / (inpAdxTrendThresh - inpAdxMRThresh) * 100.0
+
+    r2Val   = calcR2(close, inpR2Lookback)
+    float r2Score = 0.0
+    if r2Val >= inpR2TrendThresh
+        r2Score := 100.0
+    else if r2Val > inpR2MRThresh
+        r2Score := (r2Val - inpR2MRThresh) / (inpR2TrendThresh - inpR2MRThresh) * 100.0
+
+    wtSum         = inpHurstWt + inpAdxWt + inpR2Wt
+    dirConfluence = (hurstScore * inpHurstWt + adxScore * inpAdxWt + r2Score * inpR2Wt) / wtSum
+
+    string dirState = "Chop"
+    if dirConfluence >= inpConfluenceTrend
+        dirState := "Trending"
+    else if dirConfluence <= inpConfluenceMR
+        dirState := "MeanRevert"
+
+    dirTrending   = dirState == "Trending"
+    dirMeanRevert = dirState == "MeanRevert"
+
+    float dirConfidence = 0.0
+    if dirTrending
+        dirConfidence := (dirConfluence - inpConfluenceTrend) / (100.0 - inpConfluenceTrend) * 100.0
+    else if dirMeanRevert
+        dirConfidence := (inpConfluenceMR - dirConfluence) / inpConfluenceMR * 100.0
+    else
+        dirConfidence := 100.0 - math.abs(dirConfluence - (inpConfluenceTrend + inpConfluenceMR) / 2.0) / ((inpConfluenceTrend - inpConfluenceMR) / 2.0) * 100.0
+
+    // Volatility axis
+    atrVal        = ta.atr(14)
+    volPercentile = ta.percentrank(atrVal, inpVolLookback)
+    string volState = "Normal"
+    if volPercentile <= inpVolLowPct
+        volState := "Low"
+    else if volPercentile >= inpVolHighPct
+        volState := "High"
+
+    volIsLow  = volState == "Low"
+    volIsHigh = volState == "High"
+
+    float volConfidence = 0.0
+    if volIsLow
+        volConfidence := (inpVolLowPct - volPercentile) / inpVolLowPct * 100.0
+    else if volIsHigh
+        volConfidence := (volPercentile - inpVolHighPct) / (100.0 - inpVolHighPct) * 100.0
+    else
+        volConfidence := math.min(volPercentile - inpVolLowPct, inpVolHighPct - volPercentile) / ((inpVolHighPct - inpVolLowPct) / 2.0) * 100.0
+
+    // Momentum axis
+    momROC     = calcATR_ROC(close, inpMomLookback, 14)
+    momROCfast = calcATR_ROC(close, inpMomFast, 14)
+    momROCslow = calcATR_ROC(close, inpMomSlow, 14)
+
+    string momDir = "Neutral"
+    if momROC > inpMomModATR
+        momDir := "Bullish"
+    else if momROC < -inpMomModATR
+        momDir := "Bearish"
+
+    momAbsROC = math.abs(momROC)
+    string momStrength = "Weak"
+    if momAbsROC > inpMomStrongATR
+        momStrength := "Strong"
+    else if momAbsROC > inpMomModATR
+        momStrength := "Moderate"
+
+    bullAligned = momROC > 0 and momROCfast > 0 and momROCslow > 0
+    bearAligned = momROC < 0 and momROCfast < 0 and momROCslow < 0
+    aligned     = bullAligned or bearAligned
+
+    string momState = "Neutral"
+    if momDir == "Bullish"
+        if momStrength == "Strong"
+            momState := "StrongBull"
+        else if momStrength == "Moderate"
+            momState := "ModBull"
+        else
+            momState := "WeakBull"
+    else if momDir == "Bearish"
+        if momStrength == "Strong"
+            momState := "StrongBear"
+        else if momStrength == "Moderate"
+            momState := "ModBear"
+        else
+            momState := "WeakBear"
+
+    float momBaseConf = 33.0
+    if momStrength == "Strong"
+        momBaseConf := 100.0
+    else if momStrength == "Moderate"
+        momBaseConf := 66.0
+
+    float momDirConf  = momDir == "Neutral" ? 0.0 : 1.0
+    float momAlignBonus = aligned ? 20.0 : 0.0
+    float momConfidence = math.min(momBaseConf * momDirConf + momAlignBonus, 100.0)
+
+    // Regime classification with debounce
+    regime = dirState + " | " + volState + " | " + momState
+
+    var string confirmedRegime = na
+    var string prevRawRegime   = na
+    var int    rawRegimeBars   = 0
+    var int    confirmedBars   = 0
+    var bool   regimeTransition = false
+
+    if bar_index == 0
+        confirmedRegime  := regime
+        prevRawRegime    := regime
+        rawRegimeBars    := 1
+        confirmedBars    := 1
+
+    currentRawRegime = regime
+    if currentRawRegime != prevRawRegime
+        rawRegimeBars := 1
+        prevRawRegime := currentRawRegime
+    else
+        rawRegimeBars += 1
+
+    if rawRegimeBars >= inpDebounceBars
+        if currentRawRegime != confirmedRegime
+            regimeTransition := true
+            confirmedRegime  := currentRawRegime
+            confirmedBars    := 1
+        else
+            regimeTransition := false
+            confirmedBars   += 1
+    else
+        regimeTransition := false
+        confirmedBars += 1
+
+    finalRegime = confirmedRegime
+
+    // Strategy-ready export signals
+    isTrending      = str.contains(finalRegime, "Trending")
+    isMeanReverting = str.contains(finalRegime, "MeanRevert")
+    isChop          = str.contains(finalRegime, "Chop")
+    momBullish      = str.contains(finalRegime, "Bull")
+    momBearish      = str.contains(finalRegime, "Bear")
+
+    isBullishTrend = isTrending and momBullish and not str.contains(finalRegime, "Neutral")
+    isBearishTrend = isTrending and momBearish and not str.contains(finalRegime, "Neutral")
+
+    volLowFinal  = str.contains(finalRegime, "| Low |")
+    volHighFinal = str.contains(finalRegime, "| High |")
+
+    trendStrength     = dirConfluence * 0.50 + momConfidence * 0.30 + (100.0 - volPercentile) * 0.20
+    overallConfidence = dirConfidence * 0.50 + volConfidence * 0.20 + momConfidence * 0.30
+
+    RegimeState.new(
+         finalRegime,
+         isTrending,
+         isMeanReverting,
+         isChop,
+         isBullishTrend,
+         isBearishTrend,
+         regimeTransition,
+         confirmedBars,
+         dirConfluence,
+         dirConfidence,
+         trendStrength,
+         overallConfidence,
+         volPercentile,
+         volLowFinal,
+         volHighFinal,
+         momStrength,
+         momState,
+         dirState,
+         volState,
+         aligned,
+         bullAligned,
+         bearAligned,
+         momBullish,
+         momBearish,
+         diPlus,
+         diMinus,
+         adxVal,
+         momROC,
+         smoothHurst,
+         hurstScore,
+         adxScore,
+         r2Val,
+         r2Score,
+         momConfidence,
+         dirTrending,
+         dirMeanRevert)
+
+//+------------------------------------------------------------------+
+//| Trending Strategy Variables                                      |
+//+------------------------------------------------------------------+
+export calcTrendVars(RegimeState s, TrendParams p) =>
+    // Track prior-bar state (UDT fields cannot use [1] inside library functions)
+    var bool  prevBullishTrend = false
+    var bool  prevBearishTrend = false
+    var bool  prevPullbackBull = false
+    var bool  prevPullbackBear = false
+    var float prevMomROC       = na
+
+    // A. Regime gate
+    trendStable       = not s.regimeTransition and s.confirmedBars >= p.minRegimeBars
+    trendLongAllowed  = s.isBullishTrend and trendStable
+    trendShortAllowed = s.isBearishTrend and trendStable
+    trendActive       = s.isTrending and trendStable
+
+    // B. Quality filters
+    qualityPass       = s.trendStrength >= p.minTrendStrength and s.overallConfidence >= p.minConfidence
+    strongMomentum    = s.momStrength == "Strong"
+    moderateOrStrong  = s.momStrength != "Weak"
+    diBiasLong        = s.diPlus > s.diMinus
+    diBiasShort       = s.diMinus > s.diPlus
+    adxStrong         = s.adxVal >= p.minAdx
+    longReady         = trendLongAllowed and qualityPass and diBiasLong and moderateOrStrong
+    shortReady        = trendShortAllowed and qualityPass and diBiasShort and moderateOrStrong
+
+    // C. Entry timing triggers
+    newBullTrend          = s.isBullishTrend and not prevBullishTrend
+    newBearTrend          = s.isBearishTrend and not prevBearishTrend
+    trendFresh            = s.isBullishTrend and s.confirmedBars <= p.maxFreshBars
+    pullbackInBullTrend   = s.isBullishTrend and s.momStrength == "Weak" and s.dirConfluence >= p.minTrendStrength
+    pullbackInBearTrend   = s.isBearishTrend and s.momStrength == "Weak" and s.dirConfluence >= p.minTrendStrength
+    pullbackRecoveryLong  = prevPullbackBull and s.momStrength != "Weak"
+    pullbackRecoveryShort = prevPullbackBear and s.momStrength != "Weak"
+    momentumAccelLong     = not na(prevMomROC) and s.momROC > prevMomROC and s.bullAligned
+    momentumAccelShort    = not na(prevMomROC) and s.momROC < prevMomROC and s.bearAligned
+
+    prevBullishTrend := s.isBullishTrend
+    prevBearishTrend := s.isBearishTrend
+    prevPullbackBull := pullbackInBullTrend
+    prevPullbackBear := pullbackInBearTrend
+    prevMomROC       := s.momROC
+
+    // D. Exit signals
+    regimeExitLong  = s.regimeTransition and not s.isBullishTrend
+    regimeExitShort = s.regimeTransition and not s.isBearishTrend
+    trendDecay      = s.trendStrength < p.exitTrendStrength
+    confidenceDecay = s.overallConfidence < p.exitConfidence
+    momentumFade    = s.momStrength == "Weak" and not s.aligned
+    dirWeakening    = s.dirConfluence < p.exitDirConfluence
+    softExitLong    = trendDecay or confidenceDecay or momentumFade
+    hardExitLong    = regimeExitLong or s.isChop or s.isMeanReverting
+    softExitShort   = trendDecay or confidenceDecay or momentumFade
+    hardExitShort   = regimeExitShort or s.isChop or s.isMeanReverting
+
+    // E. Volatility-adjusted risk
+    volRiskScale  = s.volLow ? 1.2 : s.volHigh ? 0.6 : 1.0
+    stopAtrMult   = s.volHigh ? 2.5 : s.volLow ? 1.5 : 2.0
+    targetAtrMult = s.volHigh ? 4.0 : s.volLow ? 2.5 : 3.0
+    positionScale = (s.trendStrength / 100.0) * (s.overallConfidence / 100.0) * volRiskScale
+
+    TrendVars.new(
+         trendStable,
+         trendLongAllowed,
+         trendShortAllowed,
+         trendActive,
+         qualityPass,
+         strongMomentum,
+         moderateOrStrong,
+         diBiasLong,
+         diBiasShort,
+         adxStrong,
+         longReady,
+         shortReady,
+         newBullTrend,
+         newBearTrend,
+         trendFresh,
+         pullbackInBullTrend,
+         pullbackInBearTrend,
+         pullbackRecoveryLong,
+         pullbackRecoveryShort,
+         momentumAccelLong,
+         momentumAccelShort,
+         regimeExitLong,
+         regimeExitShort,
+         trendDecay,
+         confidenceDecay,
+         momentumFade,
+         dirWeakening,
+         softExitLong,
+         hardExitLong,
+         softExitShort,
+         hardExitShort,
+         volRiskScale,
+         stopAtrMult,
+         targetAtrMult,
+         positionScale)

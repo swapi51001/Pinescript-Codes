@@ -1,0 +1,239 @@
+//@version=6
+// Publish lib/MarketRegimeLib.pine on TradingView first, then replace YOUR_USERNAME below.
+import YOUR_USERNAME/MarketRegimeLib/1 as regime
+
+indicator("Market Regime Classifier v2.0", overlay=true, max_boxes_count=500, max_labels_count=500)
+
+//+------------------------------------------------------------------+
+//| Input Parameters — Classifier                                    |
+//+------------------------------------------------------------------+
+var string G_DIR = "━━ Directional Confluence ━━"
+inpHurstLookback    = input.int(100, "Hurst Lookback", minval=30, maxval=500, group=G_DIR, tooltip="R/S analysis lookback window")
+inpHurstSmooth      = input.int(10, "Hurst EMA Smooth", minval=1, maxval=50, group=G_DIR, tooltip="EMA smoothing period for raw Hurst")
+inpHurstWt          = input.float(0.40, "Hurst Weight", minval=0, maxval=1, step=0.05, group=G_DIR)
+inpHurstTrendThresh = input.float(0.55, "Hurst Trending Threshold", minval=0.5, maxval=0.7, step=0.01, group=G_DIR, tooltip="H > this → trending signal")
+inpHurstMRThresh    = input.float(0.45, "Hurst Mean-Revert Threshold", minval=0.3, maxval=0.5, step=0.01, group=G_DIR, tooltip="H < this → mean-reverting signal")
+
+inpAdxLen           = input.int(14, "ADX Length", minval=5, maxval=100, group=G_DIR)
+inpAdxSmooth        = input.int(14, "ADX Smoothing", minval=5, maxval=100, group=G_DIR)
+inpAdxWt            = input.float(0.35, "ADX Weight", minval=0, maxval=1, step=0.05, group=G_DIR)
+inpAdxTrendThresh   = input.float(25.0, "ADX Trending Threshold", minval=10, maxval=50, step=1, group=G_DIR, tooltip="ADX > this → trending signal")
+inpAdxMRThresh      = input.float(20.0, "ADX Mean-Revert Threshold", minval=10, maxval=30, step=1, group=G_DIR, tooltip="ADX < this → mean-reverting signal")
+
+inpR2Lookback       = input.int(50, "R² Lookback", minval=10, maxval=200, group=G_DIR)
+inpR2Wt             = input.float(0.25, "R² Weight", minval=0, maxval=1, step=0.05, group=G_DIR)
+inpR2TrendThresh    = input.float(0.40, "R² Trending Threshold", minval=0.1, maxval=0.9, step=0.05, group=G_DIR, tooltip="R² > this → trending signal")
+inpR2MRThresh       = input.float(0.20, "R² Mean-Revert Threshold", minval=0.05, maxval=0.5, step=0.05, group=G_DIR, tooltip="R² < this → mean-reverting signal")
+
+inpConfluenceTrend  = input.float(60.0, "Trending Confluence %", minval=30, maxval=90, step=5, group=G_DIR, tooltip="Weighted confluence ≥ this → Trending")
+inpConfluenceMR     = input.float(35.0, "Mean-Revert Confluence %", minval=10, maxval=50, step=5, group=G_DIR, tooltip="Weighted confluence ≤ this → Mean Reverting")
+
+var string G_VOL = "━━ Volatility ━━"
+inpVolLookback      = input.int(100, "Volatility Lookback", minval=20, maxval=500, group=G_VOL)
+inpVolLowPct        = input.float(25.0, "Low Vol Percentile", minval=5, maxval=40, step=5, group=G_VOL, tooltip="Percentile below this → Low Vol")
+inpVolHighPct       = input.float(75.0, "High Vol Percentile", minval=60, maxval=95, step=5, group=G_VOL, tooltip="Percentile above this → High Vol")
+
+var string G_MOM = "━━ Momentum ━━"
+inpMomLookback      = input.int(20, "Primary ROC Lookback", minval=5, maxval=100, group=G_MOM)
+inpMomFast          = input.int(10, "~Fast ROC Lookback", minval=3, maxval=50, group=G_MOM)
+inpMomSlow          = input.int(50, "Slow ROC Lookback", minval=20, maxval=200, group=G_MOM)
+inpMomStrongATR     = input.float(1.5, "Strong Mom ATR Multiplier", minval=0.5, maxval=5.0, step=0.25, group=G_MOM, tooltip="|ROC/ATR| > this → Strong momentum")
+inpMomModATR        = input.float(0.5, "Moderate Mom ATR Multiplier", minval=0.1, maxval=2.0, step=0.1, group=G_MOM, tooltip="|ROC/ATR| > this → Moderate momentum")
+
+var string G_TRANS = "━━ Regime Transitions ━━"
+inpDebounceBars     = input.int(3, "Debounce Bars", minval=1, maxval=10, group=G_TRANS, tooltip="Min bars for regime change confirmation")
+
+var string G_TREND = "━━ Trend Strategy Thresholds ━━"
+inpMinRegimeBars      = input.int(3, "Min Regime Bars", minval=1, maxval=20, group=G_TREND, tooltip="Bars in confirmed regime before entries allowed")
+inpMinTrendStrength   = input.float(55.0, "Min Trend Strength", minval=0, maxval=100, step=5, group=G_TREND)
+inpMinConfidence      = input.float(50.0, "Min Confidence %", minval=0, maxval=100, step=5, group=G_TREND)
+inpMinAdx             = input.float(22.0, "Min ADX", minval=10, maxval=50, step=1, group=G_TREND)
+inpMaxFreshBars       = input.int(15, "Max Fresh Trend Bars", minval=3, maxval=50, group=G_TREND)
+inpExitTrendStrength  = input.float(40.0, "Exit Trend Strength", minval=0, maxval=100, step=5, group=G_TREND)
+inpExitConfidence     = input.float(35.0, "Exit Confidence %", minval=0, maxval=100, step=5, group=G_TREND)
+inpExitDirConfluence  = input.float(45.0, "Exit Dir Confluence %", minval=0, maxval=100, step=5, group=G_TREND)
+
+var string G_DISP = "━━ Display ━━"
+inpShowDash         = input.bool(true, "Show Dashboard", group=G_DISP)
+inpShowBgColor      = input.bool(true, "Show Background Color", group=G_DISP)
+inpShowRegimeLabel  = input.bool(true, "Show Regime Labels", group=G_DISP)
+inpShowTrendVars    = input.bool(true, "Plot Trend Strategy Vars", group=G_DISP, tooltip="Export key strategy variables to the Data Window")
+
+//+------------------------------------------------------------------+
+//| Library Calls                                                    |
+//+------------------------------------------------------------------+
+regime.RegimeState s = regime.calcRegime(
+     inpHurstLookback, inpHurstSmooth, inpHurstWt, inpHurstTrendThresh, inpHurstMRThresh,
+     inpAdxLen, inpAdxSmooth, inpAdxWt, inpAdxTrendThresh, inpAdxMRThresh,
+     inpR2Lookback, inpR2Wt, inpR2TrendThresh, inpR2MRThresh,
+     inpConfluenceTrend, inpConfluenceMR,
+     inpVolLookback, inpVolLowPct, inpVolHighPct,
+     inpMomLookback, inpMomFast, inpMomSlow, inpMomStrongATR, inpMomModATR,
+     inpDebounceBars)
+
+regime.TrendParams tp = regime.TrendParams.new(
+     inpMinRegimeBars,
+     inpMinTrendStrength,
+     inpMinConfidence,
+     inpMinAdx,
+     inpMaxFreshBars,
+     inpExitTrendStrength,
+     inpExitConfidence,
+     inpExitDirConfluence)
+
+regime.TrendVars t = regime.calcTrendVars(s, tp)
+
+//+------------------------------------------------------------------+
+//| Colors & Background                                              |
+//+------------------------------------------------------------------+
+colorTrendBull    = color.new(#00C853, 0)
+colorTrendBullMod = color.new(#69F0AE, 0)
+colorTrendBullWk  = color.new(#B9F6CA, 0)
+colorTrendBear    = color.new(#D50000, 0)
+colorTrendBearMod = color.new(#FF5252, 0)
+colorTrendBearWk  = color.new(#FF8A80, 0)
+colorMR           = color.new(#7C4DFF, 0)
+colorChop         = color.new(#9E9E9E, 0)
+
+color bgColor = color.new(colorChop, 90)
+if s.isBullishTrend
+    if s.momStrength == "Strong"
+        bgColor := color.new(colorTrendBull, 85)
+    else if s.momStrength == "Moderate"
+        bgColor := color.new(colorTrendBullMod, 85)
+    else
+        bgColor := color.new(colorTrendBullWk, 85)
+else if s.isBearishTrend
+    if s.momStrength == "Strong"
+        bgColor := color.new(colorTrendBear, 85)
+    else if s.momStrength == "Moderate"
+        bgColor := color.new(colorTrendBearMod, 85)
+    else
+        bgColor := color.new(colorTrendBearWk, 85)
+else if s.isMeanReverting
+    bgColor := color.new(colorMR, 85)
+
+bgcolor(inpShowBgColor ? bgColor : na, title="Regime Background")
+
+color transColor = na
+if s.regimeTransition and inpShowBgColor
+    transColor := color.new(color.yellow, 70)
+bgcolor(transColor, title="Regime Transition")
+
+//+------------------------------------------------------------------+
+//| Dashboard Table                                                  |
+//+------------------------------------------------------------------+
+if inpShowDash and barstate.islast
+    var table dash = table.new(position.bottom_right, 2, 16, border_width=1, border_color=color.new(color.white, 60))
+
+    table.cell(dash, 0, 0, "Market Regime Classifier v2.0", bgcolor=color.new(color.gray, 40), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, "", bgcolor=color.new(color.gray, 40))
+
+    table.cell(dash, 0, 1, "Direction", text_color=color.white, text_size=size.tiny)
+    color dirBgColor = color.new(color.gray, 50)
+    if s.dirTrending
+        dirBgColor := color.new(color.green, 50)
+    else if s.dirMeanRevert
+        dirBgColor := color.new(color.purple, 50)
+    table.cell(dash, 1, 1, s.dirState + " (" + str.tostring(s.dirConfluence, "#.0") + "%)", text_color=color.white, text_size=size.tiny, bgcolor=dirBgColor)
+
+    table.cell(dash, 0, 2, "  Hurst (smoothed)", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 2, str.tostring(s.smoothHurst, "#.000") + " → " + str.tostring(s.hurstScore, "#.0") + "%", text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 3, "  ADX", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 3, str.tostring(s.adxVal, "#.0") + " → " + str.tostring(s.adxScore, "#.0") + "%", text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 4, "  R²", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 4, str.tostring(s.r2Val, "#.000") + " → " + str.tostring(s.r2Score, "#.0") + "%", text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 5, "Volatility", text_color=color.white, text_size=size.tiny)
+    color volBgColor = color.new(color.green, 50)
+    if s.volLow
+        volBgColor := color.new(color.blue, 50)
+    else if s.volHigh
+        volBgColor := color.new(color.red, 50)
+    table.cell(dash, 1, 5, s.volState + " (P" + str.tostring(s.volPercentile, "#.0") + ")", text_color=color.white, text_size=size.tiny, bgcolor=volBgColor)
+
+    table.cell(dash, 0, 6, "Momentum", text_color=color.white, text_size=size.tiny)
+    color momBgColor = color.new(color.gray, 50)
+    if s.momBullish
+        momBgColor := color.new(color.green, 50)
+    else if s.momBearish
+        momBgColor := color.new(color.red, 50)
+    table.cell(dash, 1, 6, s.momState + " (ATR-Norm: " + str.tostring(s.momROC, "#.2") + ")", text_color=color.white, text_size=size.tiny, bgcolor=momBgColor)
+
+    table.cell(dash, 0, 7, "  Alignment", text_color=color.white, text_size=size.tiny)
+    string alignStrText = "✗ Not aligned"
+    if s.aligned
+        alignStrText := "✓ " + (s.bullAligned ? "Bull" : "Bear") + " aligned"
+    table.cell(dash, 1, 7, alignStrText, text_color=color.white, text_size=size.tiny, bgcolor=s.aligned ? color.new(color.green, 50) : color.new(color.gray, 60))
+
+    table.cell(dash, 0, 8, "Confirmed Regime", text_color=color.white, text_size=size.tiny)
+    color regBgColor = color.new(color.gray, 40)
+    if s.isBullishTrend
+        regBgColor := color.new(color.green, 40)
+    else if s.isBearishTrend
+        regBgColor := color.new(color.red, 40)
+    else if s.isMeanReverting
+        regBgColor := color.new(color.purple, 40)
+    table.cell(dash, 1, 8, s.finalRegime, text_color=color.white, text_size=size.tiny, bgcolor=regBgColor)
+
+    table.cell(dash, 0, 9, "Regime Bars", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 9, str.tostring(s.confirmedBars) + " bar(s)", text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 10, "Transition", text_color=color.white, text_size=size.tiny)
+    string transStrText = "—"
+    color transBgColor = na
+    if s.regimeTransition
+        transStrText := "⚡ CHANGE"
+        transBgColor := color.new(color.yellow, 30)
+    table.cell(dash, 1, 10, transStrText, text_color=color.white, text_size=size.tiny, bgcolor=transBgColor)
+
+    table.cell(dash, 0, 11, "Trend Strength", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 11, str.tostring(s.trendStrength, "#.0") + "/100", text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 12, "Confidence", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 12, str.tostring(s.overallConfidence, "#.0") + "%", text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 13, "DI+ / DI-", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 13, str.tostring(s.diPlus, "#.1") + " / " + str.tostring(s.diMinus, "#.1"), text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 14, "Long Ready", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 14, t.longReady ? "YES" : "NO", text_color=color.white, text_size=size.tiny, bgcolor=t.longReady ? color.new(color.green, 50) : color.new(color.gray, 60))
+
+    table.cell(dash, 0, 15, "Position Scale", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 15, str.tostring(t.positionScale, "#.2"), text_color=color.white, text_size=size.tiny)
+
+//+------------------------------------------------------------------+
+//| Regime Labels on Chart                                           |
+//+------------------------------------------------------------------+
+if inpShowRegimeLabel and s.regimeTransition
+    color labelColor = colorChop
+    if s.isBullishTrend
+        labelColor := colorTrendBull
+    else if s.isBearishTrend
+        labelColor := colorTrendBear
+    else if s.isMeanReverting
+        labelColor := colorMR
+    label.new(bar_index, high, s.finalRegime, style=label.style_label_down, color=labelColor, textcolor=color.white, size=size.tiny)
+
+//+------------------------------------------------------------------+
+//| Strategy-Ready Plots (Data Window)                               |
+//+------------------------------------------------------------------+
+plot(inpShowTrendVars and s.isBullishTrend ? 1 : 0, "isBullishTrend", color.new(color.lime, 0), display=display.data_window)
+plot(inpShowTrendVars and s.isBearishTrend ? 1 : 0, "isBearishTrend", color.new(color.red, 0), display=display.data_window)
+plot(inpShowTrendVars ? s.trendStrength : na, "trendStrength", color.new(color.white, 0), display=display.data_window)
+plot(inpShowTrendVars ? s.volPercentile : na, "volPercentile", color.new(color.aqua, 0), display=display.data_window)
+plot(inpShowTrendVars and s.regimeTransition ? 1 : 0, "regimeTransition", color.new(color.yellow, 0), display=display.data_window)
+
+plot(inpShowTrendVars and t.longReady ? 1 : 0, "longReady", color.new(color.green, 0), display=display.data_window)
+plot(inpShowTrendVars and t.shortReady ? 1 : 0, "shortReady", color.new(color.maroon, 0), display=display.data_window)
+plot(inpShowTrendVars and t.newBullTrend ? 1 : 0, "newBullTrend", color.new(color.teal, 0), display=display.data_window)
+plot(inpShowTrendVars and t.newBearTrend ? 1 : 0, "newBearTrend", color.new(color.orange, 0), display=display.data_window)
+plot(inpShowTrendVars and t.pullbackRecoveryLong ? 1 : 0, "pullbackRecoveryLong", color.new(color.blue, 0), display=display.data_window)
+plot(inpShowTrendVars and t.momentumAccelLong ? 1 : 0, "momentumAccelLong", color.new(color.aqua, 0), display=display.data_window)
+plot(inpShowTrendVars and t.softExitLong ? 1 : 0, "softExitLong", color.new(color.fuchsia, 0), display=display.data_window)
+plot(inpShowTrendVars and t.hardExitLong ? 1 : 0, "hardExitLong", color.new(color.purple, 0), display=display.data_window)
+plot(inpShowTrendVars ? t.positionScale : na, "positionScale", color.new(color.silver, 0), display=display.data_window)
+plot(inpShowTrendVars ? t.stopAtrMult : na, "stopAtrMult", color.new(color.gray, 0), display=display.data_window)
+plot(inpShowTrendVars ? t.targetAtrMult : na, "targetAtrMult", color.new(color.gray, 0), display=display.data_window)
